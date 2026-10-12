@@ -1,0 +1,46 @@
+{
+  "name": "pacific-accounts-erp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Accounts Automation sub-ERP for Pacific Surfaces \u2014 commercial invoice extraction and the Accounts register.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio",
+    "db:reset": "prisma db push --force-reset",
+    "setup": "npm install && prisma db push",
+    "inngest:dev": "npx inngest-cli@latest dev",
+    "verify": "tsx --env-file=.env --conditions=react-server scripts/verify-local.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "exceljs": "4.4.0",
+    "inngest": "4.20.0",
+    "next": "15.5.25",
+    "pdfjs-dist": "4.10.38",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "server-only": "^0.0.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "3.2.0",
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "22.18.8",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "eslint": "9.18.0",
+    "eslint-config-next": "15.5.25",
+    "prisma": "6.19.3",
+    "tailwindcss": "4.3.3",
+    "tsx": "4.19.2",
+    "typescript": "5.9.3",
+    "vitest": "5.0.1"
+  }
+}

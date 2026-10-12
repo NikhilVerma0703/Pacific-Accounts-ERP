@@ -1,0 +1,447 @@
+// Accounts Automation sub-ERP — Pacific Surfaces
+//
+// Local-first: a SQLite file, no Docker, no database server to install.
+// See "Switching to PostgreSQL" in the README for the four-line change when this
+// module moves into the main ERP.
+//
+// Phase 1 uses Invoice + InvoiceDocument + FieldEdit + ImportLog + PaymentTermRule.
+// Receipt and CreditDebitNote already exist (empty) so Phase 2 adds rows, not migrations.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Invoice {
+  id String @id @default(cuid())
+
+  // -- identity / filters (mirrored out of `fields` for querying)
+  invoiceNo            String    @unique
+  invoiceDate          DateTime?
+  invoiceType          String    @default("UNKNOWN") // EXPORT | DOMESTIC | UNKNOWN
+  customerName         String?
+  consigneeName        String?
+  countryOfDestination String?
+  currency             String?
+  invoiceValue         Float?
+  exchangeRate         Float?
+  homeValue            Float? // INR equivalent
+  paymentTerms         String?
+  poNo                 String?
+  containerNo          String?
+  shippingBillNo       String?
+  blNo                 String?
+  dueDate              DateTime?
+  status               String    @default("AWAITING_PAYMENT_DATA")
+  dataQualityPct       Int       @default(0)
+  verified             Boolean   @default(false)
+  remarks              String?
+
+  // -- full payload: nothing extracted is ever discarded (JSON text)
+  fields      String
+  lineItems   String
+  quality     String
+  accountsRow String
+  warnings    String @default("[]")
+
+  // which version of the reader produced `fields`. 0 = before this was tracked,
+  // so those invoices are re-read from their stored file on first sight.
+  extractionVersion Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  document InvoiceDocument?
+  receipts Receipt[]
+  notes    CreditDebitNote[]
+  edits    FieldEdit[]
+
+
+  @@index([invoiceDate])
+  @@index([status])
+  @@index([customerName])
+  @@index([currency])
+  @@map("invoices")
+}
+
+model InvoiceDocument {
+  id        String   @id @default(cuid())
+  invoiceId String   @unique
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  fileName  String
+  format    String // XLSX | PDF
+  sha256    String   @unique
+  sizeBytes Int
+  content   Bytes
+  createdAt DateTime @default(now())
+
+  @@map("invoice_documents")
+}
+
+// ---------------------------------------------------------------- phase 2
+model Receipt {
+  id        String @id @default(cuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  // Receipt 1, 2, 3 … — the number of the column group in the register
+  seq         Int       @default(1)
+  receiptDate DateTime?
+  // the FCY figure: the amount received, in the invoice's own currency
+  amount      Float
+  currency    String?
+  // the rate on the day the money arrived, not the invoice's rate. The
+  // difference between the two is what produces the forex gain or loss.
+  exchangeRate Float?
+  homeAmount   Float?
+  bankRef      String?
+  remarks      String?
+
+  // "entered by Accounts", or the payment document this was read from. Manual
+  // entry and import produce the same row; only this says which.
+  source String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([invoiceId, seq])
+  @@index([invoiceId])
+  @@map("receipts")
+}
+
+model CreditDebitNote {
+  id        String    @id @default(cuid())
+  invoiceId String
+  invoice   Invoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  noteType  String // CREDIT | DEBIT
+  noteNo    String?
+  noteDate  DateTime?
+  amount    Float
+  currency  String?
+  reason    String?
+  createdAt DateTime  @default(now())
+
+  @@index([invoiceId])
+  @@map("credit_debit_notes")
+}
+
+// ---------------------------------------------------------------- audit & rules
+model FieldEdit {
+  id        String   @id @default(cuid())
+  invoiceId String
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  fieldKey  String
+  oldValue  String?
+  newValue  String?
+  editedBy  String   @default("Accounts")
+  createdAt DateTime @default(now())
+
+  @@index([invoiceId])
+  @@map("field_edits")
+}
+
+model PaymentTermRule {
+  id         String   @id @default(cuid())
+  label      String
+  pattern    String
+  creditDays Int      @default(0)
+  basis      String   @default("INVOICE_DATE") // INVOICE_DATE | BL_DATE | SHIPPING_BILL_DATE | ETA
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // A split term keeps its portions here ("70% CAD, balance 30% at 90 days").
+  // No rows = the ordinary single-portion term, described by creditDays + basis
+  // above, so every rule configured before split terms existed is untouched.
+  parts PaymentTermPart[]
+
+  @@map("payment_term_rules")
+}
+
+/**
+ * One portion of a split payment term.
+ *
+ * The portions of a rule must total 100% — enforced when the rule is saved and
+ * checked again when a due date is worked out, because a term that totals 97%
+ * would quietly under-bill every invoice it touches.
+ */
+model PaymentTermPart {
+  id     String          @id @default(cuid())
+  ruleId String
+  rule   PaymentTermRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  // 1, 2, 3 … and the order money settles in: earliest portion first
+  seq        Int
+  percent    Float
+  creditDays Int    @default(0)
+  basis      String @default("INVOICE_DATE")
+
+  @@unique([ruleId, seq])
+  @@map("payment_term_parts")
+}
+
+/**
+ * Settings that are *parameters*, not formulas.
+ *
+ * Ageing boundaries, how long silence is allowed to last, the tolerance below
+ * which a disagreement with a customer is just rounding. Each has a default in
+ * code, so an empty table behaves correctly and nothing breaks when a key is
+ * missing. Formulas stay in code: they are identities, not preferences.
+ */
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("app_settings")
+}
+
+model ImportLog {
+  id        String   @id @default(cuid())
+  fileName  String
+  fileHash  String?
+  outcome   String // IMPORTED | UPDATED | DUPLICATE | DELETED | FAILED
+  // invoiceId is intentionally not a relation: a DELETED line outlives its invoice
+  invoiceId String?
+  message   String?
+  createdAt DateTime @default(now())
+
+  @@index([fileHash])
+  @@map("import_log")
+}
+
+// ===========================================================================
+// PAYMENT TRACKING
+// ===========================================================================
+// A self-contained customer payment tracking system.
+//
+// It shares no table and no relation with the Accounts Register above. That is
+// deliberate and it is the point of the section: it has to work from customer
+// outstanding sheets and typed-in records alone, with no commercial invoice, no
+// Tally and no Commercial ERP as a prerequisite. Every table here is prefixed
+// `pt_` so the separation is visible in a database browser.
+//
+// Almost every column is nullable. An Accounts user must be able to save what
+// they know now and come back to the rest, so there is no field whose absence
+// stops a record being stored — not even the invoice number. What cannot be
+// calculated from what is present is reported as *requiring verification*,
+// never guessed.
+
+model PtCustomer {
+  id   String  @id @default(cuid())
+  name String?
+
+  country             String?
+  currency            String?
+  defaultPaymentTerms String?
+  consignee           String?
+  notifyParty         String?
+  contact             String?
+  notes               String?
+
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices PtInvoice[]
+  edits    PtFieldEdit[]
+
+  @@index([name])
+  @@map("pt_customers")
+}
+
+model PtInvoice {
+  id String @id @default(cuid())
+
+  /// Nullable: an invoice can be entered before anyone says whose it is, and
+  /// those are grouped under "No customer recorded" rather than refused.
+  customerId String?
+  customer   PtCustomer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  invoiceNo            String?
+  invoiceDate          DateTime?
+  customerInvoiceValue Float?
+  /// The customs / as-per-books value, where it differs from the customer's.
+  customsInvoiceValue  Float?
+  /// Home currency per one unit of foreign currency, on the invoice date.
+  exchangeRate         Float?
+  currency             String?
+  consignee            String?
+  notifyParty          String?
+  country              String?
+
+  paymentTerms String?
+  /// A due date typed in or taken from a sheet. Used in preference to the
+  /// calculated one, and always labelled as unverifiable, because the basis it
+  /// came from is not recorded.
+  enteredDueDate DateTime?
+
+  piNo             String?
+  poNo             String?
+  shippingBillNo   String?
+  shippingBillDate DateTime?
+  blNo             String?
+  blDate           DateTime?
+  containerNo      String?
+  eta              DateTime?
+  /// When the documents were presented to the bank. The basis a CAD term needs,
+  /// and the one no outstanding sheet records.
+  docsPresentedDate DateTime?
+
+  /// Balance as per books, entered from the books. Never part of the
+  /// outstanding calculation — it already has its own receipts applied, so
+  /// subtracting ours again would count them twice. Held beside the calculated
+  /// figure so the difference between them can be reported.
+  booksBalance Float?
+
+  remarks       String?
+  followUpNotes String?
+
+  /// MANUAL | EXCEL
+  source     String  @default("MANUAL")
+  sourceFile String?
+  sourceRow  Int?
+  /// The position date of the sheet this came from.
+  sourceAsOn DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  receipts PtReceipt[]
+  notes    PtNote[]
+  edits    PtFieldEdit[]
+
+  @@index([customerId])
+  @@index([invoiceNo])
+  @@index([poNo])
+  @@index([invoiceDate])
+  @@map("pt_invoices")
+}
+
+/// One receipt against one invoice. No limit, and no unique constraint on seq,
+/// so Add Receipt can always add another.
+model PtReceipt {
+  id        String    @id @default(cuid())
+  invoiceId String
+  invoice   PtInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  seq         Int       @default(1)
+  receiptDate DateTime?
+  /// Amount received in the invoice's own currency.
+  amountFcy   Float?
+  /// Home currency per one unit of foreign currency, on the day it arrived.
+  exchangeRate Float?
+  bankRef      String?
+  remarks      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([invoiceId])
+  @@map("pt_receipts")
+}
+
+model PtNote {
+  id        String    @id @default(cuid())
+  invoiceId String
+  invoice   PtInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  /// CREDIT | DEBIT
+  noteType String    @default("CREDIT")
+  noteNo   String?
+  noteDate DateTime?
+  amount   Float?
+  reason   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([invoiceId])
+  @@map("pt_notes")
+}
+
+/// One change to one field, whatever kind of record it was on.
+///
+/// Every write in this section goes through `recordEdits`, so an imported figure
+/// that somebody corrected by hand can always be told apart from one the sheet
+/// supplied — and `recordSource` says which kind of record it was, so the screen
+/// can report "the uploaded sheet said 26,756.27" beside a hand-typed figure.
+///
+/// Deliberately one table for all four record kinds rather than four tables:
+/// an invoice's history has to read as one list, and a receipt or a note is part
+/// of its invoice's story, not a separate one.
+model PtFieldEdit {
+  id String @id @default(cuid())
+
+  /// INVOICE | RECEIPT | NOTE | CUSTOMER
+  entity   String
+  /// The id of that record. Kept even for a receipt or note that is later
+  /// deleted, so the history does not develop holes.
+  entityId String
+
+  /// The invoice this change belongs to, where there is one — an invoice's own
+  /// fields, its receipts' and its notes' all carry the same invoiceId.
+  invoiceId String?
+  invoice   PtInvoice? @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  customerId String?
+  customer   PtCustomer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  fieldKey String
+  /// The field's name as the form shows it, stored so the history stays readable
+  /// after a label is reworded.
+  label    String?
+  oldValue String?
+  newValue String?
+
+  /// MANUAL | EXCEL — where the record itself came from, at the time of the
+  /// edit. This is what lets an imported value be identified as overwritten.
+  recordSource String?
+
+  editedBy  String   @default("Accounts")
+  createdAt DateTime @default(now())
+
+  @@index([invoiceId])
+  @@index([customerId])
+  @@index([entity, entityId])
+  @@map("pt_field_edits")
+}
+
+/// One upload of one customer sheet, with the file, so an import can always be
+/// explained and re-run.
+model PtImport {
+  id        String @id @default(cuid())
+  fileName  String
+  sheetName String
+  sha256    String
+
+  customerName String?
+  /// The date the figures are as at, and where it was found: a cell, the tab
+  /// name, a block caption, or a TODAY() formula — which means the sheet had no
+  /// fixed position date at all.
+  asOn       DateTime?
+  asOnSource String?
+
+  currency       String?
+  currencySource String?
+
+  rowsRead  Int @default(0)
+  created   Int @default(0)
+  updated   Int @default(0)
+  skipped   Int @default(0)
+
+  /// JSON: the column mapping used, per-row changes, duplicates and warnings.
+  report   String @default("{}")
+  warnings String @default("[]")
+
+  content   Bytes
+  createdAt DateTime @default(now())
+
+  @@index([customerName])
+  @@index([sha256])
+  @@map("pt_imports")
+}
