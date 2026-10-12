@@ -1,48 +1,40 @@
 "use client";
 
 /**
- * One customer's payment register — the screen that replaces the Excel sheet.
+ * One customer's payment register.
  *
- * It is laid out the way the sheet was, because that is the layout the work
- * already fits: a row per invoice, and the receipts spread across the row in
- * column groups of five — date, amount, rate, the rate difference, the forex
- * gain or loss — followed by the totals and the balance. Reading across a row
- * tells the whole story of one invoice's collection.
+ * A row per invoice carrying its totals — value, received, CN, DN,
+ * outstanding, due date and status. Clicking a row opens it: the invoice's
+ * editable fields, and its receipts listed one under another with the derived
+ * difference and forex gain/loss beside each. An invoice shows exactly the
+ * receipts it has — three for one, four for the next — and "Add receipt"
+ * opens as many new ones as are needed before saving. There is no limit.
  *
- * What it adds over the sheet is that the derived columns are not typed. The
- * difference, the forex, the total received, the outstanding balance and the
- * status are computed from the cells to their left, so they cannot be stale and
- * cannot disagree with the invoice screen — the same functions produce both.
- * Those cells are shaded and have no input.
- *
- * **Every row always offers one more receipt column than it has receipts**, so
- * a payment that arrives today is entered where it belongs without opening
- * anything. The invoice screen has no limit at all; this grid shows as many
- * groups as the widest invoice needs plus one.
+ * Every row's fields stay on the form while it is closed, so closing a row
+ * does not lose what was typed in it. The save applies only what differs from
+ * the stored record, and a failed save keeps everything that was entered.
  */
 import Link from "next/link";
-import { Fragment, useActionState } from "react";
-import { useFormStatus } from "react-dom";
+import { Fragment, startTransition, useActionState, useEffect, useState } from "react";
 
 import { formatMoney, formatRate, toHome } from "@/lib/money";
+import type { ReceiptMaths } from "@/lib/payments/money";
 import type { TrackedInvoice } from "@/lib/payments/record";
 import {
   saveCustomerRegisterAction,
   type RegisterSaveState,
 } from "@/server/payments/registerActions";
 import { Banner } from "@/components/ui";
-import { StatusChip } from "./bits";
+import { day, StatusChip } from "./bits";
 
-function SaveButton() {
-  const { pending } = useFormStatus();
-  return (
-    <button type="submit" className="btn" disabled={pending}>
-      {pending ? "Saving…" : "Save changes"}
-    </button>
-  );
-}
+/** Number of columns in the summary row — the open invoice spans all of them. */
+const COLS = 15;
 
-/** A derived cell: shaded, right-aligned, never an input. */
+const LABEL = "mb-1 block text-[10px] font-semibold uppercase tracking-wide text-[var(--color-ink-3)]";
+const HEADING = "text-[11px] font-bold uppercase tracking-wide text-[var(--color-ink-2)]";
+const LINK = "font-semibold text-[var(--color-brand-2)] hover:underline";
+
+/** A derived figure: never an input, so it cannot disagree with its sources. */
 function Calc({
   children,
   tone = "",
@@ -53,43 +45,82 @@ function Calc({
   title?: string;
 }) {
   return (
-    <td
-      className={`whitespace-nowrap bg-[#f7f9fc] px-2 py-1 text-right tabular-nums ${tone}`}
-      title={title}
-    >
+    <td className={`whitespace-nowrap px-3 py-2 text-right tabular-nums ${tone}`} title={title}>
       {children}
     </td>
   );
 }
 
+/** An input inside a receipt line. */
 function Cell({
   name,
   value,
   kind = "text",
-  width = "w-28",
-  align = "",
+  width,
   label,
 }: {
   name: string;
   value?: string | number | null;
   kind?: "text" | "date" | "number";
-  width?: string;
-  align?: string;
+  width: string;
   label: string;
 }) {
   return (
-    <td className="px-1 py-1">
+    <td className="px-2 py-1.5">
       <input
         name={name}
         type={kind === "date" ? "date" : "text"}
         inputMode={kind === "number" ? "decimal" : undefined}
         defaultValue={value ?? ""}
         aria-label={label}
-        className={`input px-2 py-1 text-[11px] ${width} ${
-          kind === "number" ? "text-right tabular-nums" : align
-        }`}
+        className={`input px-2 py-1 text-[12px] ${width} ${kind === "number" ? "text-right tabular-nums" : ""}`}
       />
     </td>
+  );
+}
+
+/** A labelled input in an open invoice's details. */
+function Field({
+  label,
+  name,
+  value,
+  kind = "text",
+  wide = false,
+}: {
+  label: string;
+  name: string;
+  value?: string | number | null;
+  kind?: "text" | "date" | "number";
+  wide?: boolean;
+}) {
+  return (
+    <label className={`block ${wide ? "sm:col-span-2" : ""}`}>
+      <span className={LABEL}>{label}</span>
+      <input
+        name={name}
+        type={kind === "date" ? "date" : "text"}
+        inputMode={kind === "number" ? "decimal" : undefined}
+        defaultValue={value ?? ""}
+        className={`input px-2.5 py-1.5 text-[12px] ${kind === "number" ? "text-right tabular-nums" : ""}`}
+      />
+    </label>
+  );
+}
+
+function tone(n: number | null | undefined): string {
+  if (n == null || n === 0) return "text-[var(--color-ink-3)]";
+  return n < 0 ? "text-[var(--color-bad-fg)]" : "text-[var(--color-ok-fg)]";
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-90" : ""}`}
+      aria-hidden
+    >
+      <path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
   );
 }
 
@@ -102,15 +133,53 @@ export function CustomerRegister({
   customerName: string;
   invoices: TrackedInvoice[];
 }) {
-  const [state, action] = useActionState<RegisterSaveState | null, FormData>(
+  const [state, dispatch, saving] = useActionState<RegisterSaveState | null, FormData>(
     saveCustomerRegisterAction,
     null,
   );
 
-  // as many receipt groups as the busiest invoice needs, plus one empty one to
-  // enter the next payment into; capped so the grid stays usable
-  const widest = invoices.reduce((n, i) => Math.max(n, i.money.receipts.length), 0);
-  const slots = Math.min(Math.max(widest + 1, 3), 10);
+  const [open, setOpen] = useState<Set<string>>(() => new Set());
+  // new, unsaved receipts per invoice, by the receipt number each will get
+  const [adding, setAdding] = useState<Record<string, number[]>>({});
+  // invoices with something typed since the last save
+  const [dirty, setDirty] = useState<Set<string>>(() => new Set());
+  // bumped after a save or a discard, so every input starts again from the record
+  const [version, setVersion] = useState(0);
+
+  useEffect(() => {
+    if (!state?.ok) return; // a failed save keeps everything that was typed
+    setAdding({});
+    setDirty(new Set());
+    setVersion((v) => v + 1);
+  }, [state]);
+
+  function toggle(id: string) {
+    setOpen((s) => {
+      const next = new Set(s);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function addReceipt(i: TrackedInvoice) {
+    setAdding((a) => {
+      const pending = a[i.id] ?? [];
+      const last = Math.max(0, ...i.money.receipts.map((r) => r.seq), ...pending);
+      return { ...a, [i.id]: [...pending, last + 1] };
+    });
+    setDirty((d) => new Set(d).add(i.id));
+  }
+
+  function dropReceipt(id: string, seq: number) {
+    setAdding((a) => ({ ...a, [id]: (a[id] ?? []).filter((s) => s !== seq) }));
+  }
+
+  function discard() {
+    setAdding({});
+    setDirty(new Set());
+    setVersion((v) => v + 1);
+  }
 
   const totals = invoices.reduce(
     (t, i) => ({
@@ -119,86 +188,74 @@ export function CustomerRegister({
       cn: t.cn + i.money.creditNotes,
       dn: t.dn + i.money.debitNotes,
       outstanding: t.outstanding + (i.money.calculatedOutstanding ?? 0),
-      forex: t.forex + (i.money.totalForexGainLoss ?? 0),
       home: t.home + (toHome(i.customerInvoiceValue, i.exchangeRate) ?? 0),
+      receipts: t.receipts + i.money.receipts.length,
     }),
-    { value: 0, received: 0, cn: 0, dn: 0, outstanding: 0, forex: 0, home: 0 },
+    { value: 0, received: 0, cn: 0, dn: 0, outstanding: 0, home: 0, receipts: 0 },
   );
 
   const currencies = new Set(invoices.map((i) => i.currency ?? "—"));
   const one = currencies.size === 1 ? [...currencies][0] : null;
   const ratesKnown = invoices.filter((i) => i.exchangeRate != null).length;
+  const amt = (n: number | null | undefined, cur: string | null, blank = "—") =>
+    formatMoney(n, cur, { symbol: false, blank });
+  const allOpen = invoices.length > 0 && open.size === invoices.length;
 
   return (
     <section className="card mb-5">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <h2 className="card-title mb-0">Payment register</h2>
-        <div className="flex items-center gap-2 text-[11px] text-[var(--color-ink-3)]">
-          {invoices.length} invoice(s) · {slots} receipt column(s)
+        <div className="flex items-center gap-3 text-[11px] text-[var(--color-ink-3)]">
+          <span>
+            {invoices.length} invoice(s) · {totals.receipts} receipt(s)
+          </span>
+          <button
+            type="button"
+            className="btn-ghost btn-sm"
+            onClick={() => setOpen(allOpen ? new Set() : new Set(invoices.map((i) => i.id)))}
+          >
+            {allOpen ? "Collapse all" : "Expand all"}
+          </button>
         </div>
       </div>
 
       {state && <Banner tone={state.ok ? "ok" : "bad"}>{state.message}</Banner>}
 
-      <form action={action}>
+      <form
+        onSubmit={(e) => {
+          // dispatched by hand rather than through the action prop, so a
+          // failed save does not reset the form and lose what was typed
+          e.preventDefault();
+          const data = new FormData(e.currentTarget);
+          startTransition(() => dispatch(data));
+        }}
+        onInput={(e) => {
+          const id = (e.target as HTMLElement).closest<HTMLElement>("[data-invoice]")?.dataset
+            .invoice;
+          if (id && !dirty.has(id)) setDirty((d) => new Set(d).add(id));
+        }}
+      >
         <input type="hidden" name="customerId" value={customerId} />
 
         <div className="tablewrap">
-          <table className="w-full text-[11px]">
+          <table className="w-full text-[12px]">
             <thead>
-              <tr className="bg-[#e7edf5] text-left text-[9px] uppercase tracking-wide text-[var(--color-ink-2)]">
-                <th className="px-2 py-1" colSpan={6}>
-                  Invoice
-                </th>
-                {Array.from({ length: slots }, (_, n) => (
-                  <th
-                    key={n}
-                    className="border-l-2 border-[var(--color-line)] px-2 py-1 text-center"
-                    colSpan={5}
-                  >
-                    Receipt {n + 1}
-                  </th>
-                ))}
-                <th className="border-l-2 border-[var(--color-line)] px-2 py-1" colSpan={7}>
-                  Balance
-                </th>
-              </tr>
-              <tr className="bg-[#eef2f7] text-left text-[9px] uppercase tracking-wide text-[var(--color-ink-2)]">
-                <th className="px-2 py-1">Invoice No.</th>
-                <th className="px-2 py-1">Date</th>
-                <th className="px-2 py-1">Terms</th>
-                <th className="px-2 py-1 text-right">Value (FCY)</th>
-                <th className="px-2 py-1 text-right">Inv. rate</th>
-                <th className="px-2 py-1 text-right" title="Value × invoice rate">
-                  Value (INR)
-                </th>
-                {Array.from({ length: slots }, (_, n) => (
-                  <Fragment key={n}>
-                    <th className="border-l-2 border-[var(--color-line)] px-2 py-1">Date</th>
-                    <th className="px-2 py-1 text-right">FCY</th>
-                    <th className="px-2 py-1 text-right">Rate</th>
-                    <th className="px-2 py-1 text-right" title="Receipt rate − invoice rate">
-                      Diff.
-                    </th>
-                    <th
-                      className="px-2 py-1 text-right"
-                      title="Difference × receipt amount, in INR"
-                    >
-                      Forex G/L
-                    </th>
-                  </Fragment>
-                ))}
-                <th className="border-l-2 border-[var(--color-line)] px-2 py-1 text-right">
-                  Total received
-                </th>
-                <th className="px-2 py-1 text-right">CN</th>
-                <th className="px-2 py-1 text-right">DN</th>
-                <th className="px-2 py-1 text-right">Outstanding</th>
-                <th className="px-2 py-1 text-right" title="Entered from the books">
-                  As per books
-                </th>
-                <th className="px-2 py-1">Due</th>
-                <th className="px-2 py-1">Status</th>
+              <tr className="bg-[#eef2f7] text-left text-[10px] uppercase tracking-wide text-[var(--color-ink-2)]">
+                <th className="w-8 px-2 py-2" />
+                <th className="px-3 py-2">Invoice No.</th>
+                <th className="px-3 py-2">Date</th>
+                <th className="px-3 py-2">Terms</th>
+                <th className="px-3 py-2 text-right">Value{one ? ` (${one})` : ""}</th>
+                <th className="px-3 py-2 text-right">Rate</th>
+                <th className="px-3 py-2 text-right">Value (INR)</th>
+                <th className="px-3 py-2 text-center">Receipts</th>
+                <th className="px-3 py-2 text-right">Received</th>
+                <th className="px-3 py-2 text-right">CN</th>
+                <th className="px-3 py-2 text-right">DN</th>
+                <th className="px-3 py-2 text-right">Outstanding</th>
+                <th className="px-3 py-2 text-right">As per books</th>
+                <th className="px-3 py-2">Due</th>
+                <th className="px-3 py-2">Status</th>
               </tr>
             </thead>
 
@@ -208,234 +265,400 @@ export function CustomerRegister({
                 const cur = i.currency;
                 const cn = i.notes.filter((n) => n.noteType === "CREDIT");
                 const dn = i.notes.filter((n) => n.noteType === "DEBIT");
-                const late = (i.overdueDays ?? 0) > 0;
+                // "late" only while money is still owed — a paid invoice is not overdue
+                const late = (i.overdueDays ?? 0) > 0 && (m.calculatedOutstanding ?? 0) > 0;
+                const isOpen = open.has(i.id);
+                const pending = adding[i.id] ?? [];
+                const receipts = [...m.receipts].sort((a, b) => a.seq - b.seq);
+                const pct =
+                  m.collectedPct == null ? null : Math.max(0, Math.min(100, m.collectedPct));
 
-                return (
-                  <tr key={i.id} className="border-t border-[var(--color-line)] align-middle">
-                    <td className="whitespace-nowrap px-1 py-1">
-                      <input
-                        name={`inv.${i.id}.invoiceNo`}
-                        defaultValue={i.invoiceNo ?? ""}
-                        aria-label="Invoice number"
-                        className="input w-28 px-2 py-1 text-[11px] font-medium"
-                      />
-                      <Link
-                        href={`/payment-tracking/invoice/${i.id}`}
-                        className="ml-1 text-[10px] text-[var(--color-brand-2)] hover:underline"
-                        title="Open the full invoice"
-                      >
-                        open
-                      </Link>
-                    </td>
+                // one receipt line; `r` is absent for a receipt not saved yet
+                const receiptLine = (seq: number, r?: ReceiptMaths) => (
+                  <tr
+                    key={seq}
+                    className={`border-t border-[var(--color-line)] ${r ? "" : "bg-[#fffbea]"}`}
+                  >
+                    <td className="px-3 py-1.5 font-semibold text-[var(--color-ink-2)]">{seq}</td>
                     <Cell
-                      name={`inv.${i.id}.invoiceDate`}
-                      value={i.invoiceDate}
+                      name={`rcpt.${i.id}.${seq}.receiptDate`}
+                      value={r?.receiptDate}
                       kind="date"
+                      width="w-36"
+                      label={`Receipt ${seq} date`}
+                    />
+                    <Cell
+                      name={`rcpt.${i.id}.${seq}.amountFcy`}
+                      value={r?.amountFcy}
+                      kind="number"
                       width="w-32"
-                      label="Invoice date"
+                      label={`Receipt ${seq} amount`}
                     />
                     <Cell
-                      name={`inv.${i.id}.paymentTerms`}
-                      value={i.paymentTerms}
-                      width="w-40"
-                      label="Payment terms"
-                    />
-                    <Cell
-                      name={`inv.${i.id}.customerInvoiceValue`}
-                      value={i.customerInvoiceValue}
-                      kind="number"
-                      label="Invoice value"
-                    />
-                    <Cell
-                      name={`inv.${i.id}.exchangeRate`}
-                      value={i.exchangeRate}
-                      kind="number"
-                      width="w-20"
-                      label="Invoice exchange rate"
-                    />
-                    <Calc title="Invoice value × invoice rate">
-                      {formatMoney(toHome(i.customerInvoiceValue, i.exchangeRate), "INR", {
-                        symbol: false,
-                      })}
-                    </Calc>
-
-                    {Array.from({ length: slots }, (_, n) => {
-                      const seq = n + 1;
-                      const r = m.receipts.find((x) => x.seq === seq);
-                      return (
-                        <Fragment key={seq}>
-                          <td className="border-l-2 border-[var(--color-line)] px-1 py-1">
-                            <input
-                              name={`rcpt.${i.id}.${seq}.receiptDate`}
-                              type="date"
-                              defaultValue={r?.receiptDate ?? ""}
-                              aria-label={`Receipt ${seq} date`}
-                              className="input w-32 px-2 py-1 text-[11px]"
-                            />
-                          </td>
-                          <Cell
-                            name={`rcpt.${i.id}.${seq}.amountFcy`}
-                            value={r?.amountFcy}
-                            kind="number"
-                            width="w-24"
-                            label={`Receipt ${seq} amount`}
-                          />
-                          <Cell
-                            name={`rcpt.${i.id}.${seq}.exchangeRate`}
-                            value={r?.exchangeRate}
-                            kind="number"
-                            width="w-20"
-                            label={`Receipt ${seq} exchange rate`}
-                          />
-                          <Calc
-                            tone={
-                              (r?.rateDifference ?? 0) < 0
-                                ? "text-[var(--color-bad-fg)]"
-                                : (r?.rateDifference ?? 0) > 0
-                                  ? "text-[var(--color-ok-fg)]"
-                                  : "text-[var(--color-ink-3)]"
-                            }
-                            title={r?.note ?? undefined}
-                          >
-                            {formatRate(r?.rateDifference, "")}
-                          </Calc>
-                          <Calc
-                            tone={
-                              (r?.forexGainLoss ?? 0) < 0
-                                ? "text-[var(--color-bad-fg)]"
-                                : (r?.forexGainLoss ?? 0) > 0
-                                  ? "text-[var(--color-ok-fg)]"
-                                  : "text-[var(--color-ink-3)]"
-                            }
-                            title={r?.note ?? undefined}
-                          >
-                            {formatMoney(r?.forexGainLoss, "INR", { symbol: false, blank: "" })}
-                          </Calc>
-                        </Fragment>
-                      );
-                    })}
-
-                    <Calc tone="border-l-2 border-[var(--color-line)] font-semibold">
-                      {formatMoney(m.totalReceived || null, cur, { symbol: false, blank: "" })}
-                    </Calc>
-
-                    {/* one CN cell covers the ordinary case; two or more notes
-                        are edited on the invoice screen, and the cell says so */}
-                    {cn.length > 1 ? (
-                      <Calc title={`${cn.length} credit notes — edit them on the invoice`}>
-                        <Link href={`/payment-tracking/invoice/${i.id}`} className="link">
-                          {formatMoney(m.creditNotes, cur, { symbol: false })}
-                        </Link>
-                      </Calc>
-                    ) : (
-                      <Cell
-                        name={`note.${i.id}.CREDIT.amount`}
-                        value={cn[0]?.amount}
-                        kind="number"
-                        width="w-20"
-                        label="Credit note"
-                      />
-                    )}
-                    {dn.length > 1 ? (
-                      <Calc title={`${dn.length} debit notes — edit them on the invoice`}>
-                        <Link href={`/payment-tracking/invoice/${i.id}`} className="link">
-                          {formatMoney(m.debitNotes, cur, { symbol: false })}
-                        </Link>
-                      </Calc>
-                    ) : (
-                      <Cell
-                        name={`note.${i.id}.DEBIT.amount`}
-                        value={dn[0]?.amount}
-                        kind="number"
-                        width="w-20"
-                        label="Debit note"
-                      />
-                    )}
-
-                    <Calc
-                      tone="font-semibold"
-                      title="Invoice value − receipts − CN + DN"
-                    >
-                      {formatMoney(m.calculatedOutstanding, cur, { symbol: false })}
-                    </Calc>
-                    <Cell
-                      name={`inv.${i.id}.booksBalance`}
-                      value={i.booksBalance}
+                      name={`rcpt.${i.id}.${seq}.exchangeRate`}
+                      value={r?.exchangeRate}
                       kind="number"
                       width="w-24"
-                      label="Balance as per books"
+                      label={`Receipt ${seq} exchange rate`}
                     />
-                    <td className="whitespace-nowrap px-2 py-1">
-                      {i.schedule.dueDate ? (
-                        <span className={late ? "font-semibold text-[var(--color-bad-fg)]" : ""}>
-                          {i.schedule.dueDate}
-                          {late && ` (+${i.overdueDays}d)`}
-                        </span>
-                      ) : (
-                        <span className="text-[var(--color-warn-fg)]">verify</span>
+                    <Calc tone={tone(r?.rateDifference)} title={r?.note ?? undefined}>
+                      {r ? formatRate(r.rateDifference, "—") : ""}
+                    </Calc>
+                    <Calc tone={tone(r?.forexGainLoss)} title={r?.note ?? undefined}>
+                      {r ? formatMoney(r.forexGainLoss, "INR", { symbol: false, blank: "—" }) : ""}
+                    </Calc>
+                    <Cell
+                      name={`rcpt.${i.id}.${seq}.bankRef`}
+                      value={r?.bankRef}
+                      width="w-40"
+                      label={`Receipt ${seq} bank reference`}
+                    />
+                    <td className="px-3 py-1.5 text-right">
+                      {!r && (
+                        <button
+                          type="button"
+                          onClick={() => dropReceipt(i.id, seq)}
+                          className="text-[11px] font-semibold text-[var(--color-bad-fg)] hover:underline"
+                        >
+                          Remove
+                        </button>
                       )}
                     </td>
-                    <td className="px-2 py-1">
-                      <StatusChip status={i.status} note={i.statusNote} />
-                    </td>
                   </tr>
+                );
+
+                return (
+                  <Fragment key={i.id}>
+                    <tr
+                      onClick={(e) => {
+                        if ((e.target as HTMLElement).closest("a,button")) return;
+                        toggle(i.id);
+                      }}
+                      className={`cursor-pointer border-t border-[var(--color-line)] transition-colors hover:bg-[#f5f8fc] ${
+                        isOpen ? "bg-[#f0f5fb]" : ""
+                      }`}
+                    >
+                      <td className="px-2 py-2 text-[var(--color-ink-3)]">
+                        <button
+                          type="button"
+                          onClick={() => toggle(i.id)}
+                          aria-expanded={isOpen}
+                          aria-label={`${isOpen ? "Close" : "Open"} invoice ${i.invoiceNo ?? ""}`}
+                          className="flex h-6 w-6 items-center justify-center rounded hover:bg-[var(--color-info-bg)]"
+                        >
+                          <Chevron open={isOpen} />
+                        </button>
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 font-semibold">
+                        {i.invoiceNo ?? (
+                          <span className="text-[var(--color-warn-fg)]">no number</span>
+                        )}
+                        {dirty.has(i.id) && (
+                          <span
+                            className="ml-1.5 inline-block h-1.5 w-1.5 rounded-full bg-[var(--color-warn-fg)] align-middle"
+                            title="Unsaved changes"
+                          />
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2">{day(i.invoiceDate)}</td>
+                      <td
+                        className="max-w-[180px] truncate px-3 py-2"
+                        title={i.paymentTerms ?? undefined}
+                      >
+                        {i.paymentTerms ?? "—"}
+                      </td>
+                      <Calc>{amt(i.customerInvoiceValue, cur)}</Calc>
+                      <Calc tone="text-[var(--color-ink-2)]">
+                        {formatRate(i.exchangeRate, "—")}
+                      </Calc>
+                      <Calc tone="text-[var(--color-ink-2)]">
+                        {formatMoney(toHome(i.customerInvoiceValue, i.exchangeRate), "INR", {
+                          symbol: false,
+                        })}
+                      </Calc>
+                      <td className="px-3 py-2 text-center">
+                        <span className="chip bg-[var(--color-mute-bg)] text-[var(--color-ink-2)]">
+                          {m.receipts.length}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-right tabular-nums">
+                        <div>{amt(m.totalReceived, cur)}</div>
+                        {pct != null && (
+                          <div
+                            className="ml-auto mt-1 h-1 w-20 overflow-hidden rounded-full bg-[var(--color-mute-bg)]"
+                            title={`${m.collectedPct?.toFixed(1)}% collected`}
+                          >
+                            <div
+                              className="h-full rounded-full bg-[var(--color-ok-fg)]"
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        )}
+                      </td>
+                      <Calc>{m.creditNotes ? amt(m.creditNotes, cur) : ""}</Calc>
+                      <Calc>{m.debitNotes ? amt(m.debitNotes, cur) : ""}</Calc>
+                      <Calc tone={`font-semibold ${late ? "text-[var(--color-bad-fg)]" : ""}`}>
+                        {amt(m.calculatedOutstanding, cur)}
+                      </Calc>
+                      <Calc tone="text-[var(--color-ink-2)]">{amt(i.booksBalance, cur, "")}</Calc>
+                      <td className="whitespace-nowrap px-3 py-2">
+                        {i.schedule.dueDate ? (
+                          <span className={late ? "font-semibold text-[var(--color-bad-fg)]" : ""}>
+                            {day(i.schedule.dueDate)}
+                            {late && ` · ${i.overdueDays}d late`}
+                          </span>
+                        ) : (
+                          <span className="text-[var(--color-warn-fg)]">verify</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <StatusChip status={i.status} note={i.statusNote} />
+                      </td>
+                    </tr>
+
+                    {/* the open invoice — rendered while closed too, so typed
+                        values survive closing the row */}
+                    <tr key={`${i.id}:${version}`} hidden={!isOpen} data-invoice={i.id}>
+                      <td
+                        colSpan={COLS}
+                        className="border-t border-[var(--color-line)] bg-[#f8fafc] p-0"
+                      >
+                        <div className="space-y-5 border-l-4 border-[var(--color-brand-2)] px-6 py-5">
+                          <div>
+                            <h3 className={`mb-2 ${HEADING}`}>Invoice details</h3>
+                            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-6">
+                              <Field
+                                label="Invoice No."
+                                name={`inv.${i.id}.invoiceNo`}
+                                value={i.invoiceNo}
+                              />
+                              <Field
+                                label="Invoice date"
+                                name={`inv.${i.id}.invoiceDate`}
+                                value={i.invoiceDate}
+                                kind="date"
+                              />
+                              <Field
+                                label="Payment terms"
+                                name={`inv.${i.id}.paymentTerms`}
+                                value={i.paymentTerms}
+                                wide
+                              />
+                              <Field
+                                label={`Value${cur ? ` (${cur})` : ""}`}
+                                name={`inv.${i.id}.customerInvoiceValue`}
+                                value={i.customerInvoiceValue}
+                                kind="number"
+                              />
+                              <Field
+                                label="Invoice rate (INR)"
+                                name={`inv.${i.id}.exchangeRate`}
+                                value={i.exchangeRate}
+                                kind="number"
+                              />
+                              <Field label="BL No." name={`inv.${i.id}.blNo`} value={i.blNo} />
+                              <Field
+                                label="BL date"
+                                name={`inv.${i.id}.blDate`}
+                                value={i.blDate}
+                                kind="date"
+                              />
+                              <Field
+                                label="Due date (if known)"
+                                name={`inv.${i.id}.enteredDueDate`}
+                                value={i.enteredDueDate}
+                                kind="date"
+                              />
+                              {cn.length > 1 ? (
+                                <div>
+                                  <span className={LABEL}>Credit notes ({cn.length})</span>
+                                  <Link
+                                    href={`/payment-tracking/invoice/${i.id}`}
+                                    className={`text-[12px] ${LINK}`}
+                                  >
+                                    {amt(m.creditNotes, cur)} · edit on invoice
+                                  </Link>
+                                </div>
+                              ) : (
+                                <label className="block">
+                                  <span className={LABEL}>Credit note</span>
+                                  <input
+                                    name={`note.${i.id}.CREDIT.amount`}
+                                    defaultValue={cn[0]?.amount ?? ""}
+                                    inputMode="decimal"
+                                    className="input px-2.5 py-1.5 text-right text-[12px] tabular-nums"
+                                  />
+                                </label>
+                              )}
+                              {dn.length > 1 ? (
+                                <div>
+                                  <span className={LABEL}>Debit notes ({dn.length})</span>
+                                  <Link
+                                    href={`/payment-tracking/invoice/${i.id}`}
+                                    className={`text-[12px] ${LINK}`}
+                                  >
+                                    {amt(m.debitNotes, cur)} · edit on invoice
+                                  </Link>
+                                </div>
+                              ) : (
+                                <label className="block">
+                                  <span className={LABEL}>Debit note</span>
+                                  <input
+                                    name={`note.${i.id}.DEBIT.amount`}
+                                    defaultValue={dn[0]?.amount ?? ""}
+                                    inputMode="decimal"
+                                    className="input px-2.5 py-1.5 text-right text-[12px] tabular-nums"
+                                  />
+                                </label>
+                              )}
+                              <Field
+                                label="Balance as per books"
+                                name={`inv.${i.id}.booksBalance`}
+                                value={i.booksBalance}
+                                kind="number"
+                              />
+                              <Field
+                                label="Remarks"
+                                name={`inv.${i.id}.remarks`}
+                                value={i.remarks}
+                                wide
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+                              <h3 className={HEADING}>
+                                Receipts ({receipts.length + pending.length})
+                              </h3>
+                              <span className="text-[11px] text-[var(--color-ink-3)]">
+                                Received {amt(m.totalReceived, cur)} of{" "}
+                                {amt(i.customerInvoiceValue, cur)} · Outstanding{" "}
+                                <b className="text-[var(--color-ink)]">
+                                  {amt(m.calculatedOutstanding, cur)}
+                                </b>
+                                {m.totalForexGainLoss != null && (
+                                  <>
+                                    {" "}
+                                    · Forex G/L{" "}
+                                    <b className={tone(m.totalForexGainLoss)}>
+                                      {formatMoney(m.totalForexGainLoss, "INR")}
+                                    </b>
+                                  </>
+                                )}
+                              </span>
+                            </div>
+
+                            {receipts.length + pending.length > 0 ? (
+                              <div className="max-w-full overflow-x-auto">
+                                <table className="rounded-lg border border-[var(--color-line)] bg-white text-[12px]">
+                                  <thead>
+                                    <tr className="bg-[#f4f7fb] text-left text-[10px] uppercase tracking-wide text-[var(--color-ink-2)]">
+                                      <th className="w-10 px-3 py-1.5">#</th>
+                                      <th className="px-2 py-1.5">Date</th>
+                                      <th className="px-2 py-1.5 text-right">
+                                        Amount{cur ? ` (${cur})` : ""}
+                                      </th>
+                                      <th className="px-2 py-1.5 text-right">Rate (INR)</th>
+                                      <th
+                                        className="px-3 py-1.5 text-right"
+                                        title="Receipt rate − invoice rate"
+                                      >
+                                        Diff.
+                                      </th>
+                                      <th
+                                        className="px-3 py-1.5 text-right"
+                                        title="Difference × amount, in INR"
+                                      >
+                                        Forex G/L (INR)
+                                      </th>
+                                      <th className="px-2 py-1.5">Bank ref.</th>
+                                      <th className="w-16 px-3 py-1.5" />
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {receipts.map((r) => receiptLine(r.seq, r))}
+                                    {pending.map((seq) => receiptLine(seq))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            ) : (
+                              <p className="text-[12px] text-[var(--color-ink-3)]">
+                                No receipts yet.
+                              </p>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={() => addReceipt(i)}
+                              className="btn-ghost btn-sm mt-2"
+                            >
+                              + Add receipt
+                            </button>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-4 border-t border-[var(--color-line)] pt-4">
+                            <button type="submit" className="btn btn-sm" disabled={saving}>
+                              {saving ? "Saving…" : "Save changes"}
+                            </button>
+                            <Link
+                              href={`/payment-tracking/invoice/${i.id}`}
+                              className={`text-[12px] ${LINK}`}
+                            >
+                              Open full invoice →
+                            </Link>
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  </Fragment>
                 );
               })}
             </tbody>
 
             <tfoot>
               <tr className="border-t-2 border-[var(--color-line)] bg-[#f2f6fb] font-semibold">
-                <td className="px-2 py-2" colSpan={3}>
-                  {invoices.length} invoice(s)
+                <td className="px-3 py-2" colSpan={4}>
+                  Total
                 </td>
-                <td className="px-2 py-2 text-right tabular-nums">
-                  {one ? formatMoney(totals.value, one, { symbol: false }) : "mixed"}
-                </td>
-                <td className="px-2 py-2" />
-                <td className="px-2 py-2 text-right tabular-nums" title="At each invoice's own rate">
+                <Calc>{one ? amt(totals.value, one) : "mixed"}</Calc>
+                <td />
+                <Calc title={`${ratesKnown} of ${invoices.length} invoice(s) carry a rate`}>
                   {ratesKnown ? formatMoney(totals.home, "INR", { symbol: false }) : "—"}
-                </td>
-                {Array.from({ length: slots }, (_, n) => (
-                  <td key={n} className="px-2 py-2" colSpan={5} />
-                ))}
-                <td className="border-l-2 border-[var(--color-line)] px-2 py-2 text-right tabular-nums">
-                  {one ? formatMoney(totals.received, one, { symbol: false }) : "mixed"}
-                </td>
-                <td className="px-2 py-2 text-right tabular-nums">
-                  {one ? formatMoney(totals.cn, one, { symbol: false }) : ""}
-                </td>
-                <td className="px-2 py-2 text-right tabular-nums">
-                  {one ? formatMoney(totals.dn, one, { symbol: false }) : ""}
-                </td>
-                <td className="px-2 py-2 text-right tabular-nums">
-                  {one ? formatMoney(totals.outstanding, one, { symbol: false }) : "mixed"}
-                </td>
-                <td className="px-2 py-2" colSpan={3} />
+                </Calc>
+                <td className="px-3 py-2 text-center">{totals.receipts}</td>
+                <Calc>{one ? amt(totals.received, one) : "mixed"}</Calc>
+                <Calc>{one && totals.cn ? amt(totals.cn, one) : ""}</Calc>
+                <Calc>{one && totals.dn ? amt(totals.dn, one) : ""}</Calc>
+                <Calc>{one ? amt(totals.outstanding, one) : "mixed"}</Calc>
+                <td colSpan={3} />
               </tr>
             </tfoot>
           </table>
         </div>
 
-        <div className="mt-3 flex flex-wrap items-center gap-3">
-          <SaveButton />
-          <span className="text-[11px] text-[var(--color-ink-3)]">
-            Shaded columns are calculated and recomputed on save. The last receipt column is empty
-            on every row, ready for the next payment.
-            {!one && " Currencies differ, so no column is totalled."}
-            {one && ratesKnown < invoices.length && (
-              <>
-                {" "}
-                The INR total covers the {ratesKnown} invoice(s) that carry a rate.
-              </>
-            )}
-          </span>
-        </div>
+        {dirty.size > 0 && (
+          <div className="sticky bottom-3 z-10 mt-3 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#efd9a1] bg-[var(--color-warn-bg)] px-4 py-2.5 shadow-sm">
+            <span className="text-[12px] font-semibold text-[var(--color-warn-fg)]">
+              Unsaved changes on {dirty.size} invoice(s)
+            </span>
+            <div className="flex gap-2">
+              <button type="button" className="btn-ghost btn-sm" onClick={discard} disabled={saving}>
+                Discard
+              </button>
+              <button type="submit" className="btn btn-sm" disabled={saving}>
+                {saving ? "Saving…" : "Save changes"}
+              </button>
+            </div>
+          </div>
+        )}
       </form>
 
-      <p className="mt-2 text-[10px] text-[var(--color-ink-3)]">
-        Totals in {one ?? "mixed currencies"} · forex and INR figures in INR, from each invoice&apos;s
-        own rate · {customerName}
-      </p>
+      {!one && (
+        <p className="mt-2 text-[11px] text-[var(--color-ink-3)]">
+          Currencies differ, so amounts are not totalled · {customerName}
+        </p>
+      )}
     </section>
   );
 }

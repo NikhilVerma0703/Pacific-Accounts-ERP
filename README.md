@@ -557,23 +557,27 @@ Grouping: none, customer, invoice month, PO or status.
 
 ### The customer payment register
 
-The customer screen carries an editable register — the layout the Excel sheet
-had, and the reason the Excel sheet existed. A row per invoice; the receipts
-spread across it in groups of five (date, amount, rate, **difference**, **forex
-gain/loss**); then total received, CN, DN, outstanding, books balance and status.
+The customer screen lists one row per invoice with its totals: value, rate,
+INR value, number of receipts, received (with a collected bar), CN, DN,
+outstanding, balance as per books, due date and status. Click a row (or
+**Expand all**) to open it:
 
-Every row always offers **one more receipt column than it has receipts**, so a
-payment that arrives today is typed where it belongs without opening anything.
-The whole grid saves in one go, and the derived columns — difference, forex,
-total received, outstanding, status — are shaded and have no input: they are
-computed from the cells to their left by the same functions the invoice screen
-uses, so the two cannot disagree and no total can be stale. The invoice screen
-still has no receipt limit; this grid shows as many groups as the widest invoice
-needs plus one.
+- **Invoice details**: invoice no., date, terms, value, invoice rate, BL no.,
+  BL date, due date, CN, DN, balance as per books and remarks, all editable.
+- **Receipts**: listed one under another, exactly as many as the invoice has
+  (three for one invoice, four for the next), each with date, amount, rate and
+  bank reference, and the derived **difference** and **forex gain/loss**.
+  **+ Add receipt** adds as many new lines as needed; there is no limit.
 
-CN and DN are one editable cell each, which covers the ordinary case. An invoice
-already carrying two or more notes of a type shows its total as a link instead —
-those are edited individually on the invoice.
+Closing a row keeps what was typed in it. An amber dot marks invoices with
+unsaved changes, and a bar at the bottom saves or discards them all at once.
+Only what differs from the stored record is written, every change goes into
+the correction history, and a save that fails keeps everything entered. The
+derived figures are never inputs: they are computed by the same functions the
+invoice screen uses, so the two cannot disagree.
+
+An invoice carrying two or more credit (or debit) notes shows their total as a
+link instead of an input; those are edited individually on the invoice.
 
 ### Currency formatting
 

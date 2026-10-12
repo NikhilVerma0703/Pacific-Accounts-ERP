@@ -390,6 +390,30 @@ describe("the customer register posts what its action reads", () => {
     expect(calc).not.toContain("name=");
   });
 
+  it("shows each invoice's own receipts, with no limit", () => {
+    // an invoice with three receipts shows three, one with eleven shows eleven:
+    // every stored receipt is listed, none is cut to fit a fixed column count
+    expect(grid).toMatch(/receipts\.map\(\(r\) => receiptLine\(r\.seq, r\)\)/);
+    expect(grid).not.toMatch(/receipts\.slice\(|Math\.min\([^)]*slots/);
+    // and further receipts are added per invoice, numbered after the last one
+    expect(grid).toContain("+ Add receipt");
+    expect(grid).toMatch(/Math\.max\(0, \.\.\.i\.money\.receipts\.map\(\(r\) => r\.seq\)/);
+  });
+
+  it("keeps a closed invoice's fields on the form, so closing it loses nothing", () => {
+    // the open panel is hidden, not unmounted — unmounted inputs are not posted
+    expect(grid).toMatch(/hidden=\{!isOpen\}/);
+    expect(grid).not.toMatch(/\{isOpen && \(/);
+  });
+
+  it("a failed save does not wipe what was typed", () => {
+    // the form is dispatched by hand: React resets a form whose `action` prop
+    // completes, which would throw away a rejected save's input
+    expect(grid).not.toMatch(/<form[^>]*\baction=/);
+    expect(grid).toMatch(/e\.preventDefault\(\)/);
+    expect(grid).toMatch(/if \(!state\?\.ok\) return/);
+  });
+
   it("marks no field required", () => {
     const tags = grid.match(/<(input|select|textarea)\b[^>]*>/g) ?? [];
     expect(tags.filter((t) => /\brequired\b/.test(t))).toEqual([]);
